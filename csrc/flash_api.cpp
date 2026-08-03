@@ -1009,17 +1009,20 @@ mha_fwd_sparse_decode_mla_partial(
         p.extra_block_size = extra_cache.value().size(1);
     }
 
-    // Partial (DCP) mode is BATCH-INVARIANT by construction: num_splits is
-    // forced to 1 so a token's partial (out, lse) never depends on how many
-    // other requests share the decode batch (the combined op's heuristic
-    // divides by T, making the split count -- and therefore the fp reduction
-    // order -- a function of batch size). Nothing is lost: per-rank KV under
-    // DCP is capped at the top-k width (<= 512 + swa slots), comfortably one
-    // split's worth of work, and the num_splits==1 fast path skips the
-    // combine kernel entirely.
+    // Partial (DCP) mode is BATCH-INVARIANT by construction: the split count
+    // is derived below from per-token candidate widths only, never from the
+    // batch size, so a token's fp reduction order does not depend on its
+    // batchmates.
     int head_blocks = (H + 15) / 16;
     int max_total = p.swa_topk + (extra_cache.has_value() ? p.extra_topk : 0);
-    int num_splits = 1;  // this function IS the partial op; see comment above
+    // Batch-invariant AND parallel: derive the split count from the per-token
+    // candidate width only. The combined op's sm_count*3/(T*head_blocks) term
+    // is the batch-dependent part (same token, different batchmates, different
+    // reduction order); the slots ladder below is a pure function of topk
+    // widths, so it is identical for a token regardless of who shares the
+    // batch, and it restores ~20-way split parallelism that num_splits=1
+    // destroyed (T*head_blocks CTAs on 82 SMs was ~2% occupancy at decode).
+    int num_splits = 64;  // start at the cap; cap_by_slots below shrinks it
     (void)head_blocks;
     bool decode_mma = sparse_mla_decode_fused_enabled() && sparse_mla_decode_mma_enabled();
     int slots_per_split = 32;
