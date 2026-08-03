@@ -7,6 +7,7 @@ from .flash_mla_interface import (
     sparse_mla_decode_fp8,
     sparse_mla_decode_fp4,
     sparse_mla_prefill_fp4,
+    sparse_mla_decode_fp8_partial,
     sparse_mla_prefill,
 )
 from .int8_sparse_mla import (

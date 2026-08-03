@@ -33,6 +33,34 @@ constexpr int BLOCK_H = 16;               // heads/CTA (one warp each) — fewer
 constexpr int BLOCK_N = 16;               // selected slots per tile
 constexpr int NTHREADS = BLOCK_H * 32;    // 512
 
+// ---- PARTIAL (cross-rank / DCP) mode helpers ------------------------------
+// The kernels run their online softmax in the LOG2 domain (every logit is
+// pre-multiplied by scale*log2(e)), so the running max `m` is log2-scaled while
+// the denominator `l = sum 2^(s_i - m)` is domain-free. The consumer wants a
+// NATURAL-log lse:  lse = ln(sum e^{s_i}) = m*ln2 + ln(l).
+constexpr float LN2 = 0.6931471805599453f;
+// Finite empty-shard sentinel. MUST match DCP_LSE_SENTINEL in vLLM's
+// models/deepseek_v4/common/ops/dcp.py (and NEG_LARGE in
+// v1/attention/ops/triton_mla_sparse_kernel.py): -inf would make
+// `-inf - -inf = NaN` in the merge; exp(-1e30 - g) underflows to exactly 0.
+constexpr float PARTIAL_LSE_SENTINEL = -1.0e30f;
+
+// gm: log2-domain running max over the whole shard. gl: its denominator.
+__device__ __forceinline__ float partial_lse(float gm, float gl) {
+    // `gl > 0` is false for both l == 0 and l == NaN, so an all-empty shard
+    // (gm == -inf, gl == 0) lands on the sentinel instead of inf/NaN.
+    return (gl > 0.f) ? (gm * LN2 + logf(gl)) : PARTIAL_LSE_SENTINEL;
+}
+__device__ __forceinline__ void partial_lse_store(const Sparse_mla_decode_params &p,
+                                                  int t, int h, float gm, float gl) {
+    p.lse_ptr[(int64_t)t * p.lse_token_stride + h] = partial_lse(gm, gl);
+}
+// 1/denominator for the partial epilogue: an empty shard scales its (already
+// exactly zero) accumulator by 0, never by 1e20 * NaN.
+__device__ __forceinline__ float partial_inv(float gl) {
+    return (gl > 0.f) ? (1.f / gl) : 0.f;
+}
+
 __device__ __forceinline__ float decode_k_dim(const uint8_t *data, const uint8_t *scale, int d) {
     if (d < FP8_DIM) {
         __half h = __half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)data[d], __NV_E4M3));
@@ -59,6 +87,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 // merge all splits for one (token, head) via log-sum-exp + attn_sink, write final output.
 // (run by the last split-CTA to finish for this (t, head_block) — fused, no 2nd launch.)
+template <bool kPartial>
 __device__ __forceinline__ void combine_one_head(const Sparse_mla_decode_params &p, int t, int h, int lane) {
     const int64_t pm0 = ((int64_t)t * p.num_heads + h) * p.num_splits;
     float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
@@ -69,23 +98,35 @@ __device__ __forceinline__ void combine_one_head(const Sparse_mla_decode_params 
     for (int i = 0; i < VEC; ++i) cacc[i] = 0.f;
     for (int sp = 0; sp < p.num_splits; ++sp) {
         float scale = exp2f(p.mlse_ptr[(pm0 + sp) * 2] - gm);
-        if (scale == 0.f) continue;
+        if constexpr (kPartial) {
+            // partial mode runs with NO sink, so an all-empty shard gives
+            // gm == -inf and `-inf - -inf` = NaN here; `!(x > 0)` catches both
+            // the NaN and the ordinary underflow-to-zero. The non-partial
+            // instantiation keeps the original `== 0` test byte-for-byte.
+            if (!(scale > 0.f)) continue;
+        } else {
+            if (scale == 0.f) continue;
+        }
         gl += p.mlse_ptr[(pm0 + sp) * 2 + 1] * scale;
         const __nv_bfloat16 *oacc = reinterpret_cast<const __nv_bfloat16 *>(p.oaccum_ptr) + (pm0 + sp) * HEAD_DIM;
 #pragma unroll
         for (int i = 0; i < VEC; ++i) cacc[i] += __bfloat162float(oacc[lane + i * 32]) * scale;
     }
-    float inv = 1.f / fmaxf(gl, 1e-20f);
+    float inv = kPartial ? partial_inv(gl) : (1.f / fmaxf(gl, 1e-20f));
     __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
         + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
 #pragma unroll
     for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(cacc[i] * inv);
+    if constexpr (kPartial) {
+        if (lane == 0) partial_lse_store(p, t, h, gm, gl);
+    }
 }
 
 // vectorized combine (mma path): lane owns dims [lane*16, lane*16+16) -> the per-split
 // oaccum row is read as 2x uint4 (16 bf16) instead of 16 strided scalar loads. The
 // combine runs in ONE last CTA per head block and its load chain is a real tail cost
 // at coarse splits; 8x fewer LSU ops cut it proportionally.
+template <bool kPartial>
 __device__ __forceinline__ void combine_one_head_vec(const Sparse_mla_decode_params &p, int t, int h, int lane) {
     const int64_t pm0 = ((int64_t)t * p.num_heads + h) * p.num_splits;
     float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
@@ -96,7 +137,11 @@ __device__ __forceinline__ void combine_one_head_vec(const Sparse_mla_decode_par
     for (int i = 0; i < VEC; ++i) cacc[i] = 0.f;
     for (int sp = 0; sp < p.num_splits; ++sp) {
         float scale = exp2f(p.mlse_ptr[(pm0 + sp) * 2] - gm);
-        if (scale == 0.f) continue;
+        if constexpr (kPartial) {   // see combine_one_head: NaN-safe empty shard
+            if (!(scale > 0.f)) continue;
+        } else {
+            if (scale == 0.f) continue;
+        }
         gl += p.mlse_ptr[(pm0 + sp) * 2 + 1] * scale;
         const uint4 *oacc = reinterpret_cast<const uint4 *>(
             reinterpret_cast<const __nv_bfloat16 *>(p.oaccum_ptr) + (pm0 + sp) * HEAD_DIM + lane * VEC);
@@ -112,7 +157,7 @@ __device__ __forceinline__ void combine_one_head_vec(const Sparse_mla_decode_par
             }
         }
     }
-    float inv = 1.f / fmaxf(gl, 1e-20f);
+    float inv = kPartial ? partial_inv(gl) : (1.f / fmaxf(gl, 1e-20f));
     __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
         + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride + lane * VEC;
     uint4 packed[2];
@@ -122,6 +167,9 @@ __device__ __forceinline__ void combine_one_head_vec(const Sparse_mla_decode_par
         pb[j] = __floats2bfloat162_rn(cacc[j * 2] * inv, cacc[j * 2 + 1] * inv);
     reinterpret_cast<uint4 *>(out_ptr)[0] = packed[0];
     reinterpret_cast<uint4 *>(out_ptr)[1] = packed[1];
+    if constexpr (kPartial) {
+        if (lane == 0) partial_lse_store(p, t, h, gm, gl);
+    }
 }
 
 // ---- fused-decode pre-pass: dequantize the SELECTED rows once into the dense bf16
@@ -207,6 +255,7 @@ __global__ void sparse_mla_selection_dequant_kernel(__grid_constant__ const Spar
 // ---- fused-decode attention: identical split-KV FMA attention, but K rows are clean
 // bf16 from the selection scratch (cp.async double-buffered ring; zero conversion ALU,
 // no per-tile resolve barrier). grid (T, head_blocks, num_splits).
+template <bool kPartial>
 __global__ void __launch_bounds__(NTHREADS)
 sparse_mla_decode_fused_split_kernel(__grid_constant__ const Sparse_mla_decode_params p) {
     const int t = blockIdx.x;
@@ -292,15 +341,29 @@ sparse_mla_decode_fused_split_kernel(__grid_constant__ const Sparse_mla_decode_p
 
     if (p.num_splits == 1) {
         if (active) {
-            float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
-            gm = fmaxf(gm, m);
-            float gl = l * exp2f(m - gm)
-                     + ((p.attn_sink_ptr != nullptr) ? exp2f(p.attn_sink_ptr[h] * LOG2E - gm) : 0.f);
-            float sc = exp2f(m - gm) / fmaxf(gl, 1e-20f);
-            __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
-                + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
+            if constexpr (kPartial) {
+                // PARTIAL: no sink (attn_sink_ptr is nullptr by contract), so
+                // the whole shard's max IS m and its denominator IS l. Write
+                // the normalized pre-sink row + the lse. `partial_inv` keeps
+                // an empty shard's (already zero) acc finite instead of the
+                // 0/0 -> NaN the combined path would produce without a sink.
+                float sc = partial_inv(l);
+                __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
+                    + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
 #pragma unroll
-            for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+                for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+                if (lane == 0) partial_lse_store(p, t, h, m, l);
+            } else {
+                float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
+                gm = fmaxf(gm, m);
+                float gl = l * exp2f(m - gm)
+                         + ((p.attn_sink_ptr != nullptr) ? exp2f(p.attn_sink_ptr[h] * LOG2E - gm) : 0.f);
+                float sc = exp2f(m - gm) / fmaxf(gl, 1e-20f);
+                __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
+                    + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
+#pragma unroll
+                for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+            }
         }
         return;
     }
@@ -327,7 +390,7 @@ sparse_mla_decode_fused_split_kernel(__grid_constant__ const Sparse_mla_decode_p
     __syncthreads();
     if (s_last) {
         __threadfence();
-        if (active) combine_one_head(p, t, h, lane);
+        if (active) combine_one_head<kPartial>(p, t, h, lane);
     }
 }
 
@@ -393,6 +456,7 @@ struct Smem {
 // splits without paying a per-split serial tail. The per-split mlse rows are read
 // ONE-SPLIT-PER-LANE and shfl-broadcast (no serial two-pass scalar chain), and the
 // accumulation is branchless so the oaccum uint4 loads pipeline across iterations.
+template <bool kPartial>
 __global__ void sparse_mla_combine_kernel(__grid_constant__ const Sparse_mla_decode_params p) {
     const int t = blockIdx.y;
     const int h = blockIdx.x;
@@ -444,7 +508,7 @@ __global__ void sparse_mla_combine_kernel(__grid_constant__ const Sparse_mla_dec
             cacc[8 + j * 2 + 1] += f1.y * scale;
         }
     }
-    float inv = 1.f / fmaxf(gl, 1e-20f);
+    float inv = kPartial ? partial_inv(gl) : (1.f / fmaxf(gl, 1e-20f));
     __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
         + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride + lane * VEC;
     uint4 packed[2];
@@ -454,11 +518,16 @@ __global__ void sparse_mla_combine_kernel(__grid_constant__ const Sparse_mla_dec
         pb[j] = __floats2bfloat162_rn(cacc[j * 2] * inv, cacc[j * 2 + 1] * inv);
     reinterpret_cast<uint4 *>(out_ptr)[0] = packed[0];
     reinterpret_cast<uint4 *>(out_ptr)[1] = packed[1];
+    if constexpr (kPartial) {
+        // This kernel already guards `m_sp == -INFINITY` per split, so an
+        // all-empty (t, h) yields gl == 0 exactly -> sentinel, out == 0.
+        if (lane == 0) partial_lse_store(p, t, h, gm, gl);
+    }
 }
 
 // grid (T, head_blocks=2, num_splits); 8 warps. kFusedCombine: last split-CTA per
 // head block runs the combine in-kernel; else the standalone combine kernel follows.
-template <bool kFusedCombine>
+template <bool kFusedCombine, bool kPartial>
 __global__ void __launch_bounds__(NTHREADS)
 sparse_mla_decode_mma_kernel(__grid_constant__ const Sparse_mla_decode_params p) {
     extern __shared__ char smem_raw[];
@@ -674,10 +743,17 @@ sparse_mla_decode_mma_kernel(__grid_constant__ const Sparse_mla_decode_params p)
 
     const int dcol0 = wd * D_PER_WARP;
     if (p.num_splits == 1) {
-        // direct write (sink already folded into m/l)
+        // direct write (sink already folded into m/l; NEVER folded when kPartial)
         if (wk == 0 && wn == 0 && tig == 0) {
-            s.inv_s[r0] = 1.f / fmaxf(l0, 1e-20f);
-            s.inv_s[r1] = 1.f / fmaxf(l1, 1e-20f);
+            if constexpr (kPartial) {
+                s.inv_s[r0] = partial_inv(l0);
+                s.inv_s[r1] = partial_inv(l1);
+                if (h0 < p.num_heads) partial_lse_store(p, t, h0, m0, l0);
+                if (h1 < p.num_heads) partial_lse_store(p, t, h1, m1, l1);
+            } else {
+                s.inv_s[r0] = 1.f / fmaxf(l0, 1e-20f);
+                s.inv_s[r1] = 1.f / fmaxf(l1, 1e-20f);
+            }
         }
         __syncthreads();
         const float inv0 = s.inv_s[r0];
@@ -749,7 +825,7 @@ sparse_mla_decode_mma_kernel(__grid_constant__ const Sparse_mla_decode_params p)
             __threadfence();
             for (int r = warp; r < BLOCK_M; r += NWARPS) {
                 int h = hb + r;
-                if (h < p.num_heads) combine_one_head_vec(p, t, h, lane);
+                if (h < p.num_heads) combine_one_head_vec<kPartial>(p, t, h, lane);
             }
         }
     }
@@ -758,6 +834,7 @@ sparse_mla_decode_mma_kernel(__grid_constant__ const Sparse_mla_decode_params p)
 }  // namespace mma_dec
 
 // ---- main kernel: grid (T, head_blocks, num_splits) -> partial (acc, m, l) per split ----
+template <bool kPartial>
 __global__ void __launch_bounds__(NTHREADS)
 sparse_mla_decode_split_kernel(__grid_constant__ const Sparse_mla_decode_params p) {
     const int t = blockIdx.x;
@@ -912,15 +989,24 @@ sparse_mla_decode_split_kernel(__grid_constant__ const Sparse_mla_decode_params 
     // oaccum global round-trip, no atomic, no combine (and the binding skips those allocs).
     if (p.num_splits == 1) {
         if (active) {
-            float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
-            gm = fmaxf(gm, m);
-            float gl = l * exp2f(m - gm)
-                     + ((p.attn_sink_ptr != nullptr) ? exp2f(p.attn_sink_ptr[h] * LOG2E - gm) : 0.f);
-            float sc = exp2f(m - gm) / fmaxf(gl, 1e-20f);
-            __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
-                + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
+            if constexpr (kPartial) {   // see the fused kernel's partial epilogue
+                float sc = partial_inv(l);
+                __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
+                    + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
 #pragma unroll
-            for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+                for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+                if (lane == 0) partial_lse_store(p, t, h, m, l);
+            } else {
+                float gm = (p.attn_sink_ptr != nullptr) ? p.attn_sink_ptr[h] * LOG2E : -INFINITY;
+                gm = fmaxf(gm, m);
+                float gl = l * exp2f(m - gm)
+                         + ((p.attn_sink_ptr != nullptr) ? exp2f(p.attn_sink_ptr[h] * LOG2E - gm) : 0.f);
+                float sc = exp2f(m - gm) / fmaxf(gl, 1e-20f);
+                __nv_bfloat16 *out_ptr = reinterpret_cast<__nv_bfloat16 *>(p.o_ptr)
+                    + (int64_t)t * p.out_token_stride + (int64_t)h * p.out_head_stride;
+#pragma unroll
+                for (int i = 0; i < VEC; ++i) out_ptr[lane + i * 32] = __float2bfloat16(acc[i] * sc);
+            }
         }
         return;
     }
@@ -950,7 +1036,7 @@ sparse_mla_decode_split_kernel(__grid_constant__ const Sparse_mla_decode_params 
     __syncthreads();
     if (s_last) {
         __threadfence();    // acquire every CTA's partials
-        if (active) combine_one_head(p, t, h, lane);
+        if (active) combine_one_head<kPartial>(p, t, h, lane);
     }
 }
 
@@ -1217,6 +1303,60 @@ bool sparse_mla_decode_mma_enabled() {
     return on;
 }
 
+// Partial (DCP) mode is selected purely by params.lse_ptr. Both template
+// branches below are compiled from the SAME source; the kPartial=false
+// instantiation is textually the pre-P9 kernel (every added statement sits
+// under `if constexpr (kPartial)`), so `fwd_sparse_decode_mla` is unchanged.
+template <bool kPartial>
+static void run_sparse_mla_decode_impl(Sparse_mla_decode_params &params, cudaStream_t stream) {
+    int head_blocks = (params.num_heads + BLOCK_H - 1) / BLOCK_H;
+    dim3 grid(params.num_tokens, head_blocks, params.num_splits);
+    if (params.sel_kv_ptr != nullptr && params.sel_width > 0) {
+        // fused decode: selection-scratch dequant pre-pass, then bf16 attention. The
+        // pre-pass also zeroes the combine counters (no separate memset launch).
+        dim3 dq_grid(params.sel_width, params.num_tokens);
+        sparse_mla_selection_dequant_kernel<<<dq_grid, HEAD_DIM / 2, 0, stream>>>(params);
+        // heads-as-M tensor-core attention (H2); FLASH_MLA_DECODE_MMA=0 falls back to
+        // the FMA fused kernel (H1) for A/B comparison.
+        if (sparse_mla_decode_mma_enabled()) {
+            dim3 mgrid(params.num_tokens,
+                       (params.num_heads + mma_dec::BLOCK_M - 1) / mma_dec::BLOCK_M,
+                       params.num_splits);
+            int smem = (int)sizeof(mma_dec::Smem);
+            static bool attr_set = false;
+            if (!attr_set) {
+                cudaFuncSetAttribute(mma_dec::sparse_mla_decode_mma_kernel<true, kPartial>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                cudaFuncSetAttribute(mma_dec::sparse_mla_decode_mma_kernel<false, kPartial>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                attr_set = true;
+            }
+            // standalone parallel combine by default (one warp per head, splits merged
+            // wide); FLASH_MLA_DECODE_FUSED_COMBINE=1 keeps the last-CTA in-kernel one.
+            static const bool fused_combine = [] {
+                const char *e = getenv("FLASH_MLA_DECODE_FUSED_COMBINE");
+                return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+            }();
+            if (fused_combine || params.num_splits == 1) {
+                mma_dec::sparse_mla_decode_mma_kernel<true, kPartial>
+                    <<<mgrid, mma_dec::NTHREADS, smem, stream>>>(params);
+            } else {
+                mma_dec::sparse_mla_decode_mma_kernel<false, kPartial>
+                    <<<mgrid, mma_dec::NTHREADS, smem, stream>>>(params);
+                dim3 cgrid(params.num_heads, params.num_tokens);
+                mma_dec::sparse_mla_combine_kernel<kPartial><<<cgrid, 32, 0, stream>>>(params);
+            }
+            return;
+        }
+        sparse_mla_decode_fused_split_kernel<kPartial><<<grid, NTHREADS, 0, stream>>>(params);
+        return;
+    }
+    if (params.num_splits > 1)  // num_splits==1 fast path writes output directly, no counter/combine
+        cudaMemsetAsync(params.combine_counter_ptr, 0,
+                        (size_t)params.num_tokens * head_blocks * sizeof(int), stream);
+    sparse_mla_decode_split_kernel<kPartial><<<grid, NTHREADS, 0, stream>>>(params);
+}
+
 void run_sparse_mla_decode(Sparse_mla_decode_params &params, cudaStream_t stream) {
     // Prefill (num_splits==1): a batched tensor-core QK+PV kernel (mma_pf) is available but is
     // ~2x SLOWER than the FMA path here -- this workload is gather-MEMORY-LATENCY bound, not
@@ -1234,8 +1374,11 @@ void run_sparse_mla_decode(Sparse_mla_decode_params &params, cudaStream_t stream
       // another format. Their bindings therefore force sel_kv allocation.
       assert(params.sel_kv_ptr != nullptr && params.sel_width > 0);
     }
+    // mma_pf writes no {m, l} and no lse -- it is an opt-in prefill experiment,
+    // never a partial producer. Partial mode always takes the split kernels.
     if (params.num_splits == 1 && prefill_mma &&
-        params.cache_format == Sparse_mla_cache_format::FP8_DS_MLA) {
+        params.cache_format == Sparse_mla_cache_format::FP8_DS_MLA &&
+        params.lse_ptr == nullptr) {
       dim3 grid(params.num_tokens,
                 (params.num_heads + mma_pf::BLOCK_M - 1) / mma_pf::BLOCK_M);
       int smem = (int)sizeof(mma_pf::Smem);
@@ -1250,50 +1393,12 @@ void run_sparse_mla_decode(Sparse_mla_decode_params &params, cudaStream_t stream
       return;
     }
 
-    int head_blocks = (params.num_heads + BLOCK_H - 1) / BLOCK_H;
-    dim3 grid(params.num_tokens, head_blocks, params.num_splits);
-    if (params.sel_kv_ptr != nullptr && params.sel_width > 0) {
-        // fused decode: selection-scratch dequant pre-pass, then bf16 attention. The
-        // pre-pass also zeroes the combine counters (no separate memset launch).
-        dim3 dq_grid(params.sel_width, params.num_tokens);
-        sparse_mla_selection_dequant_kernel<<<dq_grid, HEAD_DIM / 2, 0, stream>>>(params);
-        // heads-as-M tensor-core attention (H2); FLASH_MLA_DECODE_MMA=0 falls back to
-        // the FMA fused kernel (H1) for A/B comparison.
-        if (sparse_mla_decode_mma_enabled()) {
-            dim3 mgrid(params.num_tokens,
-                       (params.num_heads + mma_dec::BLOCK_M - 1) / mma_dec::BLOCK_M,
-                       params.num_splits);
-            int smem = (int)sizeof(mma_dec::Smem);
-            static bool attr_set = false;
-            if (!attr_set) {
-                cudaFuncSetAttribute(mma_dec::sparse_mla_decode_mma_kernel<true>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-                cudaFuncSetAttribute(mma_dec::sparse_mla_decode_mma_kernel<false>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-                attr_set = true;
-            }
-            // standalone parallel combine by default (one warp per head, splits merged
-            // wide); FLASH_MLA_DECODE_FUSED_COMBINE=1 keeps the last-CTA in-kernel one.
-            static const bool fused_combine = [] {
-                const char *e = getenv("FLASH_MLA_DECODE_FUSED_COMBINE");
-                return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
-            }();
-            if (fused_combine || params.num_splits == 1) {
-                mma_dec::sparse_mla_decode_mma_kernel<true>
-                    <<<mgrid, mma_dec::NTHREADS, smem, stream>>>(params);
-            } else {
-                mma_dec::sparse_mla_decode_mma_kernel<false>
-                    <<<mgrid, mma_dec::NTHREADS, smem, stream>>>(params);
-                dim3 cgrid(params.num_heads, params.num_tokens);
-                mma_dec::sparse_mla_combine_kernel<<<cgrid, 32, 0, stream>>>(params);
-            }
-            return;
-        }
-        sparse_mla_decode_fused_split_kernel<<<grid, NTHREADS, 0, stream>>>(params);
+    if (params.lse_ptr != nullptr) {
+        // PARTIAL: no sink may be folded anywhere -- the cross-rank merge adds
+        // it once, at the global max (ARCHITECTURE.md section 10 rule 1).
+        assert(params.attn_sink_ptr == nullptr);
+        run_sparse_mla_decode_impl<true>(params, stream);
         return;
     }
-    if (params.num_splits > 1)  // num_splits==1 fast path writes output directly, no counter/combine
-        cudaMemsetAsync(params.combine_counter_ptr, 0,
-                        (size_t)params.num_tokens * head_blocks * sizeof(int), stream);
-    sparse_mla_decode_split_kernel<<<grid, NTHREADS, 0, stream>>>(params);
+    run_sparse_mla_decode_impl<false>(params, stream);
 }

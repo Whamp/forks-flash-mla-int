@@ -906,6 +906,166 @@ void boxed_fwd_sparse_decode_mla(StableIValue *stack, uint64_t num_args, uint64_
     stack[0] = from(res);
 }
 
+// ---------------------------------------------- sparse-MLA decode, PARTIAL (DCP) form
+//
+// Same kernels, different epilogue: instead of the combined + attn_sink-folded
+// result, this returns THIS SHARD's contribution in the exact form a
+// context-parallel LSE merge consumes:
+//
+//   out [T, H, 512] bf16  -- shard-local softmax output, NORMALIZED, PRE-SINK
+//   lse [T, H]      fp32  -- shard-local log-sum-exp, NATURAL log
+//
+// which is precisely the (cp_attn_out, cp_attn_lse) pair vLLM's
+// `dcp_a2a_lse_reduce(..., is_lse_base_on_e=True)` / `dcp_merge_flashmla_output`
+// take, so the consumer needs NO adapter (in particular no
+// `softmax_stats_to_lse` round trip: the kernel fuses m + log(l) in fp32
+// registers before the value ever reaches memory).
+//
+// There is deliberately NO attn_sink argument. The sink must enter exactly once,
+// at the GLOBAL max across ranks, which only the merge can do; folding it per
+// shard would count it `world_size` times.
+//
+// Empty shards (a token for which this rank owns no selected entry) return an
+// exactly-zero output row and lse = -1e30 (finite; -inf would make the merge's
+// `lse - lse_max` a NaN). Their merge weight underflows to 0.
+//
+// `out`/`lse_out`: optional caller-owned destinations. A CUDA-graph capture
+// bakes in kernel argument addresses; passing persistent buffers keeps the
+// captured op writing where the captured consumer reads, with no reliance on
+// the graph private pool for the two tensors that outlive the op.
+std::vector<Tensor>
+mha_fwd_sparse_decode_mla_partial(
+    Tensor q,                                   // [T, H, 512] bf16
+    Tensor swa_cache,                           // [nb, bs, 584] uint8 fp8_ds_mla
+    Tensor swa_indices,                         // [T, swa_topk] int32
+    Tensor swa_lens,                            // [T] int32
+    double scale,
+    std::optional<Tensor> extra_cache,
+    std::optional<Tensor> extra_indices,
+    std::optional<Tensor> extra_lens,
+    std::optional<Tensor> out_,                 // [T, H, 512] bf16 or None
+    std::optional<Tensor> lse_out_              // [T, H] float32 or None
+) {
+    int device = torch::stable::accelerator::getCurrentDeviceIndex();
+    auto props = get_dev_props(device);
+    CHECK_SPARSE_MLA_ARCH(props, "sparse-MLA decode kernel");
+
+    int T = q.size(0), H = q.size(1), D = q.size(2);
+    STD_TORCH_CHECK(D == 512, "head_dim must be 512");
+    STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16, "q must be bfloat16");
+    CHECK_DEVICE(q); CHECK_DEVICE(swa_cache); CHECK_DEVICE(swa_indices); CHECK_DEVICE(swa_lens);
+    STD_TORCH_CHECK(swa_indices.scalar_type() == ScalarType::Int, "swa_indices must be int32");
+    STD_TORCH_CHECK(swa_lens.scalar_type() == ScalarType::Int, "swa_lens must be int32");
+
+    torch::stable::accelerator::DeviceGuard guard(device);
+    Tensor out = out_.has_value() ? out_.value() : torch::stable::new_empty(q, {T, H, D});
+    if (out_.has_value()) {
+        CHECK_DEVICE(out);
+        STD_TORCH_CHECK(out.scalar_type() == ScalarType::BFloat16, "out must be bfloat16");
+        CHECK_SHAPE(out, T, H, D);
+        // the kernels write 16-byte vectors along d and index rows by stride
+        STD_TORCH_CHECK(out.stride(2) == 1, "out rows must be contiguous");
+    }
+    Tensor lse = lse_out_.has_value()
+        ? lse_out_.value()
+        : torch::stable::new_empty(q, {T, H}, ScalarType::Float);
+    if (lse_out_.has_value()) {
+        CHECK_DEVICE(lse);
+        STD_TORCH_CHECK(lse.scalar_type() == ScalarType::Float, "lse_out must be float32");
+        CHECK_SHAPE(lse, T, H);
+        STD_TORCH_CHECK(lse.stride(1) == 1, "lse_out rows must be contiguous");
+    }
+
+    Sparse_mla_decode_params p = {};
+    p.num_tokens = T;
+    p.num_heads = H;
+    p.block_size = swa_cache.size(1);
+    p.scale_log2 = static_cast<float>(scale * M_LOG2E);
+    p.q_ptr = q.data_ptr();
+    p.q_token_stride = q.stride(0);
+    p.q_head_stride = q.stride(1);
+    p.o_ptr = out.data_ptr();
+    p.out_token_stride = out.stride(0);
+    p.out_head_stride = out.stride(1);
+    p.cache_format = Sparse_mla_cache_format::FP8_DS_MLA;
+    p.attn_sink_ptr = nullptr;     // PARTIAL: the merge adds the sink, once.
+    p.lse_ptr = reinterpret_cast<float *>(lse.data_ptr());
+    p.lse_token_stride = lse.stride(0);
+    p.swa_cache_ptr = swa_cache.data_ptr();
+    p.swa_block_stride = swa_cache.stride(0);
+    p.swa_indices_ptr = reinterpret_cast<const int *>(swa_indices.data_ptr());
+    p.swa_lens_ptr = reinterpret_cast<const int *>(swa_lens.data_ptr());
+    p.swa_topk = swa_indices.size(1);
+    p.swa_num_blocks = swa_cache.size(0);
+    if (extra_cache.has_value()) {
+        STD_TORCH_CHECK(extra_indices.has_value() && extra_lens.has_value(),
+                        "extra indices/lens required with extra cache");
+        p.extra_cache_ptr = extra_cache.value().data_ptr();
+        p.extra_block_stride = extra_cache.value().stride(0);
+        p.extra_indices_ptr = reinterpret_cast<const int *>(extra_indices.value().data_ptr());
+        p.extra_lens_ptr = reinterpret_cast<const int *>(extra_lens.value().data_ptr());
+        p.extra_topk = extra_indices.value().size(1);
+        p.extra_num_blocks = extra_cache.value().size(0);
+        p.extra_block_size = extra_cache.value().size(1);
+    }
+
+    // Split policy copied verbatim from mha_fwd_sparse_decode_mla: it is a pure
+    // function of (sm_count, T, H, topk widths) -- all HOST constants for a
+    // given captured shape, so a captured graph re-launches the same geometry.
+    int head_blocks = (H + 15) / 16;
+    int max_total = p.swa_topk + (extra_cache.has_value() ? p.extra_topk : 0);
+    int num_splits = props.sm_count * 3 / (T * head_blocks > 0 ? T * head_blocks : 1);
+    bool decode_mma = sparse_mla_decode_fused_enabled() && sparse_mla_decode_mma_enabled();
+    int slots_per_split = 32;
+    if (decode_mma) {
+        int tgt = (max_total + 15) / 16;
+        tgt = (tgt + 15) / 16 * 16;
+        slots_per_split = std::max(32, tgt);
+    }
+    if (const char *e = getenv("FLASH_MLA_SLOTS_PER_SPLIT")) { int v = atoi(e); if (v > 0) slots_per_split = v; }
+    int cap_by_slots = (max_total + slots_per_split - 1) / slots_per_split;
+    if (cap_by_slots < 1) cap_by_slots = 1;
+    if (num_splits > cap_by_slots) num_splits = cap_by_slots;
+    if (num_splits < 1) num_splits = 1;
+    if (num_splits > 64) num_splits = 64;
+    p.num_splits = num_splits;
+
+    bool split = num_splits > 1;
+    Tensor oaccum = torch::stable::new_empty(q, {split ? T : 1, H, num_splits, D});
+    Tensor mlse = torch::stable::new_empty(q, {split ? T : 1, H, num_splits, 2}, ScalarType::Float);
+    Tensor counter = torch::stable::new_empty(q, {split ? T * head_blocks : 1}, ScalarType::Int);
+    p.oaccum_ptr = oaccum.data_ptr();
+    p.mlse_ptr = reinterpret_cast<float *>(mlse.data_ptr());
+    p.combine_counter_ptr = reinterpret_cast<int *>(counter.data_ptr());
+
+    bool fused = split && sparse_mla_decode_fused_enabled();
+    Tensor sel_kv = torch::stable::new_empty(q, {fused ? (int64_t)T * max_total : 1, D});
+    p.sel_kv_ptr = fused ? sel_kv.data_ptr() : nullptr;
+    p.sel_width = max_total;
+
+    cudaStream_t stream = current_cuda_stream(device);
+    run_sparse_mla_decode(p, stream);
+    return {out, lse};
+}
+
+void boxed_fwd_sparse_decode_mla_partial(StableIValue *stack, uint64_t num_args, uint64_t num_outputs) {
+    auto q = to<Tensor>(stack[0]);
+    auto swa_cache = to<Tensor>(stack[1]);
+    auto swa_indices = to<Tensor>(stack[2]);
+    auto swa_lens = to<Tensor>(stack[3]);
+    auto scale = to<double>(stack[4]);
+    auto extra_cache = to<std::optional<Tensor>>(stack[5]);
+    auto extra_indices = to<std::optional<Tensor>>(stack[6]);
+    auto extra_lens = to<std::optional<Tensor>>(stack[7]);
+    auto out = to<std::optional<Tensor>>(stack[8]);
+    auto lse_out = to<std::optional<Tensor>>(stack[9]);
+    auto res = mha_fwd_sparse_decode_mla_partial(q, swa_cache, swa_indices, swa_lens, scale,
+                                                 extra_cache, extra_indices, extra_lens,
+                                                 out, lse_out);
+    stack[0] = from(res[0]);
+    stack[1] = from(res[1]);
+}
+
 void boxed_fwd_sparse_int8_decode_mla(StableIValue *stack, uint64_t num_args, uint64_t num_outputs) {
     auto q = to<Tensor>(stack[0]);
     auto swa_cache = to<Tensor>(stack[1]);
@@ -1016,6 +1176,13 @@ STABLE_TORCH_LIBRARY(flash_mla, m) {
           "float scale, Tensor? attn_sink, Tensor? extra_cache, Tensor? "
           "extra_indices, "
           "Tensor? extra_lens) -> Tensor");
+    // PARTIAL (context-parallel) decode: normalized PRE-SINK out + natural-log
+    // fp32 lse, for a cross-rank LSE merge that adds the sink exactly once.
+    // No attn_sink argument by design. out/lse_out are optional caller-owned
+    // destinations so a CUDA-graph capture can bake in stable addresses.
+    m.def("fwd_sparse_decode_mla_partial(Tensor q, Tensor swa_cache, Tensor swa_indices, "
+          "Tensor swa_lens, float scale, Tensor? extra_cache, Tensor? extra_indices, "
+          "Tensor? extra_lens, Tensor(a!)? out, Tensor(b!)? lse_out) -> (Tensor, Tensor)");
     m.def("fwd_sparse_prefill_mla(Tensor q, Tensor swa_cache, Tensor swa_indices, Tensor swa_lens, "
           "float scale, Tensor? attn_sink, Tensor? extra_cache, Tensor? extra_indices, "
           "Tensor? extra_lens) -> Tensor");
@@ -1038,6 +1205,7 @@ STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
     m.impl("fwd_kvcache_mla", &boxed_fwd_kvcache_mla);
     m.impl("fwd_sparse_decode_mla", &boxed_fwd_sparse_decode_mla);
     m.impl("fwd_sparse_fp4_decode_mla", &boxed_fwd_sparse_fp4_decode_mla);
+    m.impl("fwd_sparse_decode_mla_partial", &boxed_fwd_sparse_decode_mla_partial);
     m.impl("fwd_sparse_prefill_mla", &boxed_fwd_sparse_prefill_mla);
     m.impl("fwd_sparse_fp4_prefill_mla", &boxed_fwd_sparse_fp4_prefill_mla);
     m.impl("fwd_sparse_int8_prefill_mla", &boxed_fwd_sparse_int8_prefill_mla);

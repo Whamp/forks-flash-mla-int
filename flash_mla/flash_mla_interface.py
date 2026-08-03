@@ -267,6 +267,66 @@ def sparse_mla_prefill_fp4(
     )
 
 
+def sparse_mla_decode_fp8_partial(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    scale: Optional[float] = None,
+    extra_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lens: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Context-parallel PARTIAL form of :func:`sparse_mla_decode_fp8`.
+
+    Same kernels and same selection semantics; only the epilogue differs. Where
+    the combined op returns one attn_sink-folded result, this returns THIS
+    SHARD's contribution in the form an LSE merge consumes:
+
+        out: (num_decode_tokens, num_heads, 512) bfloat16 -- shard-local
+            softmax output, NORMALIZED and **pre-sink**.
+        lse: (num_decode_tokens, num_heads) float32 -- shard-local log-sum-exp
+            in the NATURAL log domain (``m*ln2 + ln(l)``, fused in fp32
+            registers inside the kernel).
+
+    There is no ``attn_sink`` argument on purpose: the sink must be folded in
+    exactly ONCE, at the global max over all shards, which only the merge can
+    do. Folding it per shard would count it ``world_size`` times.
+
+    A shard that owns no selected entry for a token returns an exactly-zero
+    output row and ``lse = -1e30`` -- finite, so ``lse - lse_max`` never
+    produces NaN, and ``exp(-1e30 - g)`` underflows to 0 so the shard drops out
+    of the merge.
+
+    ``out`` / ``lse_out`` are optional pre-allocated destinations. Pass them
+    from a CUDA-graph-captured region so the captured launch writes to an
+    address that is still valid (and still the consumer's) on replay.
+    """
+    if scale is None:
+        scale = q.shape[-1] ** (-0.5)
+    if not hasattr(torch.ops.flash_mla, "fwd_sparse_decode_mla_partial"):
+        raise NotImplementedError(
+            "torch.ops.flash_mla.fwd_sparse_decode_mla_partial is not built "
+            "yet (rebuild the fork: the DCP partial decode op is P9)."
+        )
+    swa_indices = _flatten_sparse_indices(swa_indices)
+    extra_indices = _flatten_sparse_indices(extra_indices)
+    return torch.ops.flash_mla.fwd_sparse_decode_mla_partial(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lens,
+        float(scale),
+        extra_cache,
+        extra_indices,
+        extra_lens,
+        out,
+        lse_out,
+    )
+
+
 def sparse_mla_prefill(
     q: torch.Tensor,
     swa_cache: torch.Tensor,

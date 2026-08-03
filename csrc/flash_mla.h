@@ -119,6 +119,19 @@ struct Sparse_mla_decode_params {
     int64_t extra_pos_stride;
     int64_t extra_scale_block_stride, extra_scale_pos_stride;
     Sparse_mla_cache_format cache_format;
+    // PARTIAL (context-parallel) mode. nullptr = today's behavior: o_ptr gets
+    // the combined, attn_sink-folded, normalized output and nothing else is
+    // written.  Non-null selects the partial epilogue used by a cross-rank
+    // (DCP) merge:
+    //   * o_ptr  <- this shard's NORMALIZED, PRE-SINK output  [T, H, 512] bf16
+    //   * lse_ptr<- this shard's fp32 log-sum-exp, NATURAL log [T, H]
+    // The sink is NEVER folded in partial mode (the merge adds it exactly once
+    // at the global max), so the binding must pass attn_sink_ptr == nullptr.
+    // Shards that saw no key at all (l == 0) emit an exactly-zero output row
+    // and the finite sentinel -1e30 (never -inf: -inf - -inf = NaN poisons the
+    // merge; exp(-1e30 - g) underflows to 0 so the shard drops out).
+    float *lse_ptr;              // [T, H] fp32, row stride lse_token_stride
+    int64_t lse_token_stride;    // in elements
 };
 
 // True when the selection-scratch fused decode path is enabled (env kill-switch
