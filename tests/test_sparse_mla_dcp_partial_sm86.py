@@ -238,12 +238,13 @@ def test_prefill_block_m_16_and_32_agree():
         "torch.manual_seed(11);d='cuda';T,H,topk=4,16,96;n=topk+32;"
         # deterministic non-degenerate cache bytes; the kernel dequantizes them
         # identically at either BLOCK_M, so only the tiling differs.
-        # sane fp8 payload: random E4M3 data bytes; RoPE bf16 region ZEROED
-        # (random bytes decode to inf/NaN bf16) and scale exponents clamped to
-        # a +/-2^4 window (raw randint scales reach 2^128 -> inf -> the two
-        # BLOCK_M variants could only ever agree on garbage).
+        # sane fp8 payload -- three NaN sources in raw random bytes, all
+        # neutralized: E4M3 data bytes & 0x7E (0x7F/0xFF are E4M3 NaN),
+        # RoPE bf16 region zeroed (random bytes decode to inf/NaN), scale
+        # exponents clamped to a +/-2^4 window (raw scales reach 2^128).
         "g=torch.Generator(device='cpu').manual_seed(5);"
         "c=torch.randint(0,255,(n,1,584),generator=g,dtype=torch.uint8);"
+        "c[:,:,:448]&=126;"
         "c[:,:,448:576]=0;"
         "c[:,:,576:584]=torch.randint(123,132,(n,1,8),generator=g,dtype=torch.uint8);"
         "c=c.to(d);"
