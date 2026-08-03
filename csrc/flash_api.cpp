@@ -1009,12 +1009,18 @@ mha_fwd_sparse_decode_mla_partial(
         p.extra_block_size = extra_cache.value().size(1);
     }
 
-    // Split policy copied verbatim from mha_fwd_sparse_decode_mla: it is a pure
-    // function of (sm_count, T, H, topk widths) -- all HOST constants for a
-    // given captured shape, so a captured graph re-launches the same geometry.
+    // Partial (DCP) mode is BATCH-INVARIANT by construction: num_splits is
+    // forced to 1 so a token's partial (out, lse) never depends on how many
+    // other requests share the decode batch (the combined op's heuristic
+    // divides by T, making the split count -- and therefore the fp reduction
+    // order -- a function of batch size). Nothing is lost: per-rank KV under
+    // DCP is capped at the top-k width (<= 512 + swa slots), comfortably one
+    // split's worth of work, and the num_splits==1 fast path skips the
+    // combine kernel entirely.
     int head_blocks = (H + 15) / 16;
     int max_total = p.swa_topk + (extra_cache.has_value() ? p.extra_topk : 0);
-    int num_splits = props.sm_count * 3 / (T * head_blocks > 0 ? T * head_blocks : 1);
+    int num_splits = 1;  // this function IS the partial op; see comment above
+    (void)head_blocks;
     bool decode_mma = sparse_mla_decode_fused_enabled() && sparse_mla_decode_mma_enabled();
     int slots_per_split = 32;
     if (decode_mma) {
