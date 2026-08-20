@@ -195,6 +195,78 @@ def sparse_mla_decode_fp8(
     )
 
 
+def sparse_mla_decode_fp4(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """SM86 sparse MLA decode over the native ``fp4_ds_mla`` cache.
+
+    Each 368-byte physical row contains 224 bytes of packed E2M1 NoPE data,
+    128 bytes of BF16 RoPE data, and 16 bytes of scale storage (14 UE8M0
+    per-32-value scales plus two zero padding bytes). The native selected-row
+    pre-pass decodes FP4 to BF16 before the existing split-KV attention kernel.
+    """
+    if scale is None:
+        scale = q.shape[-1] ** (-0.5)
+    if not hasattr(torch.ops.flash_mla, "fwd_sparse_fp4_decode_mla"):
+        raise NotImplementedError(
+            "torch.ops.flash_mla.fwd_sparse_fp4_decode_mla is not built yet"
+        )
+    swa_indices = _flatten_sparse_indices(swa_indices)
+    extra_indices = _flatten_sparse_indices(extra_indices)
+    return torch.ops.flash_mla.fwd_sparse_fp4_decode_mla(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lens,
+        float(scale),
+        attn_sink,
+        extra_cache,
+        extra_indices,
+        extra_lens,
+    )
+
+
+def sparse_mla_prefill_fp4(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """SM86 sparse MLA prefill over the native ``fp4_ds_mla`` cache."""
+    if scale is None:
+        scale = q.shape[-1] ** (-0.5)
+    if not hasattr(torch.ops.flash_mla, "fwd_sparse_fp4_prefill_mla"):
+        raise NotImplementedError(
+            "torch.ops.flash_mla.fwd_sparse_fp4_prefill_mla is not built yet"
+        )
+    swa_indices = _flatten_sparse_indices(swa_indices)
+    extra_indices = _flatten_sparse_indices(extra_indices)
+    return torch.ops.flash_mla.fwd_sparse_fp4_prefill_mla(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lens,
+        float(scale),
+        attn_sink,
+        extra_cache,
+        extra_indices,
+        extra_lens,
+    )
+
+
 def sparse_mla_prefill(
     q: torch.Tensor,
     swa_cache: torch.Tensor,

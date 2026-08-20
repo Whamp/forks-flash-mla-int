@@ -17,6 +17,7 @@
 #include <math.h>
 
 #include "flash_mla.h"
+#include "fp4_ds_mla.cuh"
 
 namespace {
 
@@ -41,12 +42,13 @@ __device__ __forceinline__ float decode_k_dim(const uint8_t *data, const uint8_t
     return __bfloat162float(rope[d - FP8_DIM]);
 }
 
-__device__ __forceinline__ void slot_ptrs(const uint8_t *cache, int64_t block_stride, int block_size,
-                                          int slot, const uint8_t *&data, const uint8_t *&scale) {
-    int b = slot / block_size, i = slot - b * block_size;
-    const uint8_t *blk = cache + (int64_t)b * block_stride;
-    data = blk + (int64_t)i * TOKEN_DATA_SIZE;
-    scale = blk + (int64_t)block_size * TOKEN_DATA_SIZE + (int64_t)i * SCALE_DIM;
+__device__ __forceinline__ void
+fp8_slot_ptrs(const uint8_t *cache, int64_t block_stride, int block_size,
+              int slot, const uint8_t *&data, const uint8_t *&scale) {
+  int b = slot / block_size, i = slot - b * block_size;
+  const uint8_t *blk = cache + (int64_t)b * block_stride;
+  data = blk + (int64_t)i * TOKEN_DATA_SIZE;
+  scale = blk + (int64_t)block_size * TOKEN_DATA_SIZE + (int64_t)i * SCALE_DIM;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -159,25 +161,34 @@ __global__ void sparse_mla_selection_dequant_kernel(__grid_constant__ const Spar
         dst[threadIdx.x] = __nv_bfloat162(__float2bfloat16(0.f), __float2bfloat16(0.f));
         return;
     }
-    if (p.int8_cache) {
-        // int8_ds_mla: 512 int8 payload bytes + one fp32 rowwise scale, both
-        // addressed through runtime strides (vLLM's 528B inline layout or the
-        // separate-tensor layout). bf16 = int8 * scale.
-        const int b = s / bsize, pos = s - b * bsize;
-        const int64_t pstride = is_ex ? p.extra_pos_stride : p.swa_pos_stride;
-        const float *scale_base = is_ex ? p.extra_scale_ptr : p.swa_scale_ptr;
-        const int64_t sbstride = is_ex ? p.extra_scale_block_stride : p.swa_scale_block_stride;
-        const int64_t spstride = is_ex ? p.extra_scale_pos_stride : p.swa_scale_pos_stride;
-        const int8_t *row = reinterpret_cast<const int8_t *>(cache)
-            + (int64_t)b * bstride + (int64_t)pos * pstride;
-        const float sc = scale_base[(int64_t)b * sbstride + (int64_t)pos * spstride];
-        dst[threadIdx.x] = __nv_bfloat162(
-            __float2bfloat16((float)row[d] * sc),
-            __float2bfloat16((float)row[d + 1] * sc));
-        return;
+    if (p.cache_format == Sparse_mla_cache_format::INT8_DS_MLA) {
+      // int8_ds_mla: 512 int8 payload bytes + one fp32 rowwise scale, both
+      // addressed through runtime strides (vLLM's 528B inline layout or the
+      // separate-tensor layout). bf16 = int8 * scale.
+      const int b = s / bsize, pos = s - b * bsize;
+      const int64_t pstride = is_ex ? p.extra_pos_stride : p.swa_pos_stride;
+      const float *scale_base = is_ex ? p.extra_scale_ptr : p.swa_scale_ptr;
+      const int64_t sbstride =
+          is_ex ? p.extra_scale_block_stride : p.swa_scale_block_stride;
+      const int64_t spstride =
+          is_ex ? p.extra_scale_pos_stride : p.swa_scale_pos_stride;
+      const int8_t *row = reinterpret_cast<const int8_t *>(cache) +
+                          (int64_t)b * bstride + (int64_t)pos * pstride;
+      const float sc =
+          scale_base[(int64_t)b * sbstride + (int64_t)pos * spstride];
+      dst[threadIdx.x] =
+          __nv_bfloat162(__float2bfloat16((float)row[d] * sc),
+                         __float2bfloat16((float)row[d + 1] * sc));
+      return;
+    }
+    if (p.cache_format == Sparse_mla_cache_format::FP4_DS_MLA) {
+      const uint8_t *data, *scale;
+      fp4_ds_mla::row_pointers(cache, bstride, bsize, s, data, scale);
+      dst[threadIdx.x] = fp4_ds_mla::decode_pair(data, scale, d);
+      return;
     }
     const uint8_t *data, *scale;
-    slot_ptrs(cache, bstride, bsize, s, data, scale);
+    fp8_slot_ptrs(cache, bstride, bsize, s, data, scale);
     __nv_bfloat16 v0, v1;
     if (d < FP8_DIM) {
         unsigned short raw2 = *reinterpret_cast<const unsigned short *>(data + d);
@@ -809,7 +820,10 @@ sparse_mla_decode_split_kernel(__grid_constant__ const Sparse_mla_decode_params 
                 int64_t bstride = is_ex ? p.extra_block_stride : p.swa_block_stride;
                 int bsize = is_ex ? p.extra_block_size : p.block_size;
                 int nslots = is_ex ? extra_slots : swa_slots;
-                if (s >= 0 && s < nslots) { slot = s; slot_ptrs(cache, bstride, bsize, s, dptr, sptr); }
+                if (s >= 0 && s < nslots) {
+                  slot = s;
+                  fp8_slot_ptrs(cache, bstride, bsize, s, dptr, sptr);
+                }
             }
             rslot_s[buf][tid] = slot;
             src_data_s[buf][tid] = dptr;
@@ -1050,7 +1064,8 @@ sparse_mla_prefill_mma_kernel(__grid_constant__ const Sparse_mla_decode_params p
                     int slot = idx_row[base + n];
                     if (slot >= 0 && slot < num_slots) {
                         const uint8_t *data, *scale;
-                        slot_ptrs(st.cache, st.block_stride, st.block_size, slot, data, scale);
+                        fp8_slot_ptrs(st.cache, st.block_stride, st.block_size,
+                                      slot, data, scale);
                         val = decode_k_dim(data, scale, d);
                     }
                 }
@@ -1213,24 +1228,26 @@ void run_sparse_mla_decode(Sparse_mla_decode_params &params, cudaStream_t stream
         const char *e = getenv("FLASH_MLA_PREFILL_MMA");
         return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
     }();
-    if (params.int8_cache) {
-        // int8 rows exist ONLY in the selection-scratch pre-pass; the raw-cache
-        // consumers (mma_pf prefill, legacy in-CTA-dequant split kernel) decode
-        // fp8_ds_mla bytes and must never see an int8 cache. The binding forces
-        // sel_kv allocation for int8.
-        assert(params.sel_kv_ptr != nullptr && params.sel_width > 0);
+    if (params.cache_format != Sparse_mla_cache_format::FP8_DS_MLA) {
+      // INT8 and FP4 rows exist only in the selection-scratch pre-pass. The
+      // raw-cache consumers below hard-decode fp8_ds_mla and must never see
+      // another format. Their bindings therefore force sel_kv allocation.
+      assert(params.sel_kv_ptr != nullptr && params.sel_width > 0);
     }
-    if (params.num_splits == 1 && prefill_mma && !params.int8_cache) {
-        dim3 grid(params.num_tokens, (params.num_heads + mma_pf::BLOCK_M - 1) / mma_pf::BLOCK_M);
-        int smem = (int)sizeof(mma_pf::Smem);
-        static bool attr_set = false;
-        if (!attr_set) {
-            cudaFuncSetAttribute(mma_pf::sparse_mla_prefill_mma_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-            attr_set = true;
-        }
-        mma_pf::sparse_mla_prefill_mma_kernel<<<grid, mma_pf::NTHREADS, smem, stream>>>(params);
-        return;
+    if (params.num_splits == 1 && prefill_mma &&
+        params.cache_format == Sparse_mla_cache_format::FP8_DS_MLA) {
+      dim3 grid(params.num_tokens,
+                (params.num_heads + mma_pf::BLOCK_M - 1) / mma_pf::BLOCK_M);
+      int smem = (int)sizeof(mma_pf::Smem);
+      static bool attr_set = false;
+      if (!attr_set) {
+        cudaFuncSetAttribute(mma_pf::sparse_mla_prefill_mma_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        attr_set = true;
+      }
+      mma_pf::sparse_mla_prefill_mma_kernel<<<grid, mma_pf::NTHREADS, smem,
+                                              stream>>>(params);
+      return;
     }
 
     int head_blocks = (params.num_heads + BLOCK_H - 1) / BLOCK_H;
