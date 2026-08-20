@@ -69,6 +69,12 @@ struct mha_fwd_splitkv_mla_ws {
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream,
                              int head_size, bool is_bf16, bool is_sm90, bool warp_spec);
 
+enum class Sparse_mla_cache_format : uint8_t {
+  FP8_DS_MLA = 0,
+  INT8_DS_MLA = 1,
+  FP4_DS_MLA = 2,
+};
+
 // Ampere sm_86 sparse-MLA decode (DeepSeek-V4-Flash absorbed form, head_dim 512, V==K).
 struct Sparse_mla_decode_params {
     int num_tokens, num_heads, block_size;
@@ -101,17 +107,18 @@ struct Sparse_mla_decode_params {
     // redundancy). nullptr on the legacy in-CTA-dequant path.
     void *sel_kv_ptr;
     int sel_width;
-    // int8_ds_mla cache (rowwise int8 + fp32 scale), addressed ONLY through these
-    // runtime strides (the vLLM 528-byte token layout arrives as strided views).
-    // int8_cache=true selects the int8 dequant in the selection-scratch pre-pass;
-    // the binding forces the fused path, so the attention kernels stay bf16-only.
-    const float *swa_scale_ptr;        // [nb, bs] fp32 or nullptr for fp8
+    // int8_ds_mla cache (rowwise int8 + fp32 scale), addressed ONLY through
+    // these runtime strides (the vLLM 528-byte token layout arrives as strided
+    // views). FP4 and INT8 are decoded only in the selection-scratch pre-pass;
+    // their bindings force the fused path, so the attention kernels stay
+    // bf16-only.
+    const float *swa_scale_ptr; // [nb, bs] fp32 for INT8; nullptr otherwise
     int64_t swa_pos_stride;            // int8 bytes between tokens in a block
     int64_t swa_scale_block_stride, swa_scale_pos_stride;  // in elements
     const float *extra_scale_ptr;
     int64_t extra_pos_stride;
     int64_t extra_scale_block_stride, extra_scale_pos_stride;
-    bool int8_cache;
+    Sparse_mla_cache_format cache_format;
 };
 
 // True when the selection-scratch fused decode path is enabled (env kill-switch
@@ -148,14 +155,14 @@ struct Sparse_mla_prefill_params {
     int64_t extra_scale_block_stride, extra_scale_pos_stride;
     const int *extra_indices_ptr;
     const int *extra_lens_ptr;
-    bool int8_cache;
+    Sparse_mla_cache_format cache_format;
 };
 
-// Fused tensor-core sparse-MLA prefill. Handles BOTH fp8_ds_mla and int8_ds_mla
-// caches (params.int8_cache selects the dequant path). fp8: kv_ptr is the
+// Fused tensor-core sparse-MLA prefill. Handles FP8, INT8, and FP4 DS-MLA
+// caches (params.cache_format selects the dequant path). FP8: kv_ptr is the
 // [total_slots, 512] bf16 whole-cache dequant buffer, sized by the binding.
-// int8: NO pre-pass and no pool-sized buffer — raw int8 rows are gathered and
-// dequantized in-kernel (kv_ptr must be nullptr).
+// INT8/FP4: no whole-cache pre-pass or pool-sized buffer — compressed rows are
+// gathered and dequantized in-kernel (kv_ptr must be nullptr).
 void run_sparse_mla_prefill(Sparse_mla_prefill_params &params,
                             cudaStream_t stream);
 

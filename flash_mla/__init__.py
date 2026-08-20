@@ -5,6 +5,8 @@ from .flash_mla_interface import (
     flash_mla_with_kvcache,
     flash_mla_with_kvcache_int8,
     sparse_mla_decode_fp8,
+    sparse_mla_decode_fp4,
+    sparse_mla_prefill_fp4,
     sparse_mla_prefill,
 )
 from .int8_sparse_mla import (

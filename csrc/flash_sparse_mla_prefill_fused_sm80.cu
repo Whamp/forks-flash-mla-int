@@ -34,6 +34,7 @@
 #include <type_traits>
 
 #include "flash_mla.h"
+#include "fp4_ds_mla.cuh"
 
 namespace {
 
@@ -144,59 +145,78 @@ struct SmemInt8 : Smem {
     int8_t k8_s[2][BLOCK_N][HEAD_DIM];       // 16 KB int8 staging ring
     float scale8_s[2][BLOCK_N];
 };
-static_assert(sizeof(Smem) % 16 == 0, "k8_s must stay 16B-aligned for cp.async");
+
+struct SmemFP4 : Smem {
+  uint8_t token_data4_s[2][BLOCK_N][fp4_ds_mla::kTokenDataBytes];
+  uint8_t scale4_s[2][BLOCK_N][fp4_ds_mla::kScaleBytes];
+  const void *src_scale4_s[2][BLOCK_N];
+};
+static_assert(sizeof(Smem) % 16 == 0,
+              "quantized staging rings must stay 16B-aligned for cp.async");
 // sm_86 and sm_121 both report cudaDevAttrMaxSharedMemoryPerBlockOptin =
 // 101376 B (measured on an RTX A5000 and on a GB10), so this bound covers
 // consumer Blackwell unchanged — the int8 prefill path needed no resizing to
 // run on a DGX Spark.
 static_assert(sizeof(SmemInt8) <= 100 * 1024, "sm_86 / sm_121 dynamic smem budget");
+static_assert(sizeof(SmemFP4) <= 100 * 1024,
+              "sm_86 / sm_121 dynamic smem budget");
 
-template <bool INT8_GATHER>
-__global__ void __launch_bounds__(NTHREADS)
-sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_params p,
-                                const int swa_slots, const int total_slots) {
-    extern __shared__ char smem_raw[];
-    using SmemT = std::conditional_t<INT8_GATHER, SmemInt8, Smem>;
-    SmemT &s = *reinterpret_cast<SmemT *>(smem_raw);
-    // grid is (head_blocks, T): blockIdx.x varies fastest, so the two head-block CTAs
-    // of one token are ADJACENT in issue order and the second hits L2 for the gather
-    const int t = blockIdx.y;
-    const int hb = blockIdx.x * BLOCK_M;
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int wm = warp & 1;         // m16 tile
-    const int wn = (warp >> 1) & 1;  // QK n8 slice (0..1)
-    const int wk = warp >> 2;        // QK k-split half (0..1)
-    const int wd = warp >> 1;        // PV d128 slice (0..3)
-    const int group = lane >> 2;
-    const int tig = lane & 3;
-    const int qc = tig * 2;
+template <Sparse_mla_cache_format CACHE_FORMAT>
+__global__ void __launch_bounds__(NTHREADS) sparse_prefill_fused_mma_kernel(
+    __grid_constant__ const Sparse_mla_prefill_params p, const int swa_slots,
+    const int total_slots) {
+  constexpr bool INT8_GATHER =
+      CACHE_FORMAT == Sparse_mla_cache_format::INT8_DS_MLA;
+  constexpr bool FP4_GATHER =
+      CACHE_FORMAT == Sparse_mla_cache_format::FP4_DS_MLA;
+  extern __shared__ char smem_raw[];
+  using SmemT =
+      std::conditional_t<INT8_GATHER, SmemInt8,
+                         std::conditional_t<FP4_GATHER, SmemFP4, Smem>>;
+  SmemT &s = *reinterpret_cast<SmemT *>(smem_raw);
+  // grid is (head_blocks, T): blockIdx.x varies fastest, so the two head-block
+  // CTAs of one token are ADJACENT in issue order and the second hits L2 for
+  // the gather
+  const int t = blockIdx.y;
+  const int hb = blockIdx.x * BLOCK_M;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int wm = warp & 1;        // m16 tile
+  const int wn = (warp >> 1) & 1; // QK n8 slice (0..1)
+  const int wk = warp >> 2;       // QK k-split half (0..1)
+  const int wd = warp >> 1;       // PV d128 slice (0..3)
+  const int group = lane >> 2;
+  const int tig = lane & 3;
+  const int qc = tig * 2;
 
-    // ---- load q tile ----
-    for (int e = tid; e < BLOCK_M * HEAD_DIM; e += NTHREADS) {
-        int r = e >> 9, c = e & 511;
-        int h = hb + r;
-        __nv_bfloat16 v = __float2bfloat16(0.f);
-        if (h < p.num_heads) {
-            const __nv_bfloat16 *qp = reinterpret_cast<const __nv_bfloat16 *>(p.q_ptr) +
-                (int64_t)t * p.q_token_stride + (int64_t)h * p.q_head_stride;
-            v = qp[c];
-        }
-        s.q_s[r][c] = v;
+  // ---- load q tile ----
+  for (int e = tid; e < BLOCK_M * HEAD_DIM; e += NTHREADS) {
+    int r = e >> 9, c = e & 511;
+    int h = hb + r;
+    __nv_bfloat16 v = __float2bfloat16(0.f);
+    if (h < p.num_heads) {
+      const __nv_bfloat16 *qp =
+          reinterpret_cast<const __nv_bfloat16 *>(p.q_ptr) +
+          (int64_t)t * p.q_token_stride + (int64_t)h * p.q_head_stride;
+      v = qp[c];
     }
+    s.q_s[r][c] = v;
+  }
 
-    const int r0 = wm * 16 + group;
-    const int r1 = r0 + 8;
-    const int h0 = hb + r0;
-    const int h1 = hb + r1;
-    const bool sink = p.attn_sink_ptr != nullptr;
-    float m0 = (sink && h0 < p.num_heads) ? p.attn_sink_ptr[h0] * LOG2E : -INFINITY;
-    float m1 = (sink && h1 < p.num_heads) ? p.attn_sink_ptr[h1] * LOG2E : -INFINITY;
-    float l0 = (sink && h0 < p.num_heads) ? 1.f : 0.f;
-    float l1 = (sink && h1 < p.num_heads) ? 1.f : 0.f;
+  const int r0 = wm * 16 + group;
+  const int r1 = r0 + 8;
+  const int h0 = hb + r0;
+  const int h1 = hb + r1;
+  const bool sink = p.attn_sink_ptr != nullptr;
+  float m0 =
+      (sink && h0 < p.num_heads) ? p.attn_sink_ptr[h0] * LOG2E : -INFINITY;
+  float m1 =
+      (sink && h1 < p.num_heads) ? p.attn_sink_ptr[h1] * LOG2E : -INFINITY;
+  float l0 = (sink && h0 < p.num_heads) ? 1.f : 0.f;
+  float l1 = (sink && h1 < p.num_heads) ? 1.f : 0.f;
 
-    float acc[D_PER_WARP / 8][4];
+  float acc[D_PER_WARP / 8][4];
 #pragma unroll
     for (int d = 0; d < D_PER_WARP / 8; ++d)
 #pragma unroll
@@ -208,13 +228,13 @@ sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_param
     const int n_tiles = (len + BLOCK_N - 1) / BLOCK_N;
     const __nv_bfloat16 *kv = reinterpret_cast<const __nv_bfloat16 *>(p.kv_ptr);
 
-    // map concatenated selection g -> source row pointer (nullptr = zero row):
-    // dense bf16 row (fp8 path, whole-cache dequant buffer) or raw int8 cache row
-    // plus its fp32 rowwise scale (int8 path).
+    // Map concatenated selection g to a source row. FP8 uses the whole-cache
+    // BF16 buffer; INT8 and FP4 point at their compressed row sections.
     auto resolve = [&](int tile) {
         if (tid < BLOCK_N) {
             int g = tile * BLOCK_N + tid;
             const void *src = nullptr;
+            const void *scale_src = nullptr;
             float sc = 0.f;
             if (g < len) {
                 bool is_ex = g >= swa_len;
@@ -236,13 +256,29 @@ sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_param
                         int b = sidx / bsize, pos = sidx - b * bsize;
                         src = cache + (int64_t)b * bstride + (int64_t)pos * pstride;
                         sc = scale_base[(int64_t)b * sbstride + (int64_t)pos * spstride];
+                    } else if constexpr (FP4_GATHER) {
+                      const uint8_t *cache = reinterpret_cast<const uint8_t *>(
+                          is_ex ? p.extra_cache_ptr : p.swa_cache_ptr);
+                      const int64_t block_stride =
+                          is_ex ? p.extra_block_stride : p.swa_block_stride;
+                      const int block_size =
+                          is_ex ? p.extra_block_size : p.swa_block_size;
+                      const uint8_t *token_data;
+                      const uint8_t *scales;
+                      fp4_ds_mla::row_pointers(cache, block_stride, block_size,
+                                               sidx, token_data, scales);
+                      src = token_data;
+                      scale_src = scales;
                     } else {
-                        src = kv + ((int64_t)(is_ex ? swa_slots + sidx : sidx)) * HEAD_DIM;
+                      src = kv + ((int64_t)(is_ex ? swa_slots + sidx : sidx)) *
+                                     HEAD_DIM;
                     }
                 }
             }
             s.src_row_s[tile & 1][tid] = src;
             if constexpr (INT8_GATHER) s.scale8_s[tile & 1][tid] = sc;
+            if constexpr (FP4_GATHER)
+              s.src_scale4_s[tile & 1][tid] = scale_src;
         }
     };
 
@@ -261,18 +297,39 @@ sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_param
                     __pipeline_memcpy_async(&s.k8_s[buf][n][c], src + c, 16);
                 }
             }
+        } else if constexpr (FP4_GATHER) {
+#pragma unroll 2
+          for (int vp = tid; vp < BLOCK_N * (fp4_ds_mla::kTokenDataBytes / 16);
+               vp += NTHREADS) {
+            const int chunks_per_row = fp4_ds_mla::kTokenDataBytes / 16;
+            int n = vp / chunks_per_row;
+            int c = (vp - n * chunks_per_row) * 16;
+            const uint8_t *src =
+                reinterpret_cast<const uint8_t *>(s.src_row_s[buf][n]);
+            if (src != nullptr) {
+              __pipeline_memcpy_async(&s.token_data4_s[buf][n][c], src + c, 16);
+            }
+          }
+          if (tid < BLOCK_N) {
+            const uint8_t *src =
+                reinterpret_cast<const uint8_t *>(s.src_scale4_s[buf][tid]);
+            if (src != nullptr) {
+              __pipeline_memcpy_async(&s.scale4_s[buf][tid][0], src,
+                                      fp4_ds_mla::kScaleBytes);
+            }
+          }
         } else {
 #pragma unroll 4
-            for (int vp = tid; vp < BLOCK_N * ROW_CHUNKS; vp += NTHREADS) {
-                int n = vp >> 6, c = (vp & 63) * 8;  // 8 bf16 = 16B per chunk
-                const __nv_bfloat16 *src =
-                    reinterpret_cast<const __nv_bfloat16 *>(s.src_row_s[buf][n]);
-                if (src != nullptr) {
-                    __pipeline_memcpy_async(&s.k_s[buf][n][c], src + c, 16);
-                } else {
-                    *reinterpret_cast<uint4 *>(&s.k_s[buf][n][c]) = uint4{0, 0, 0, 0};
-                }
+          for (int vp = tid; vp < BLOCK_N * ROW_CHUNKS; vp += NTHREADS) {
+            int n = vp >> 6, c = (vp & 63) * 8; // 8 bf16 = 16B per chunk
+            const __nv_bfloat16 *src =
+                reinterpret_cast<const __nv_bfloat16 *>(s.src_row_s[buf][n]);
+            if (src != nullptr) {
+              __pipeline_memcpy_async(&s.k_s[buf][n][c], src + c, 16);
+            } else {
+              *reinterpret_cast<uint4 *>(&s.k_s[buf][n][c]) = uint4{0, 0, 0, 0};
             }
+          }
         }
         __pipeline_commit();
     };
@@ -303,6 +360,20 @@ sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_param
                 dst[1] = __nv_bfloat162(__float2bfloat16((float)v.z * sc),
                                         __float2bfloat16((float)v.w * sc));
             }
+        } else if constexpr (FP4_GATHER) {
+#pragma unroll
+          for (int e = tid; e < BLOCK_N * (HEAD_DIM / 2); e += NTHREADS) {
+            const int n = e >> 8;
+            const int dimension = (e & 255) * 2;
+            __nv_bfloat162 value =
+                __nv_bfloat162(__float2bfloat16(0.f), __float2bfloat16(0.f));
+            if (s.src_row_s[buf][n] != nullptr) {
+              value = fp4_ds_mla::decode_pair(s.token_data4_s[buf][n],
+                                              s.scale4_s[buf][n], dimension);
+            }
+            *reinterpret_cast<__nv_bfloat162 *>(&s.k_s[buf][n][dimension]) =
+                value;
+          }
         }
         if (i + 1 < n_tiles) resolve(i + 1);
         __syncthreads();  // src ptrs + dequanted ring[buf] visible (and resolve doesn't race issue below)
@@ -458,11 +529,10 @@ sparse_prefill_fused_mma_kernel(__grid_constant__ const Sparse_mla_prefill_param
 
 }  // namespace
 
-// Fused tensor-core prefill. fp8_ds_mla: dequantize the whole cache once into a
-// dense bf16 [total_slots, 512] buffer, then run the gather-bf16 mma.m16n8k16
-// attention kernel. int8_ds_mla: NO pre-pass and NO pool-sized buffer — the same
-// attention kernel gathers raw int8 rows and dequantizes them in smem
-// (INT8_GATHER=true). This is the only sparse prefill path -- the legacy staged
+// Fused tensor-core prefill. fp8_ds_mla dequantizes the whole cache once into
+// BF16. INT8 and FP4 avoid that pool-sized allocation: they gather compressed
+// rows and dequantize each selected tile in shared memory. This is the only
+// sparse prefill path -- the legacy staged
 // two-kernel gather path was removed (dead code, unreachable in production,
 // ~4x slower at the true 16k footprint).
 void run_sparse_mla_prefill(Sparse_mla_prefill_params &params,
@@ -473,17 +543,31 @@ void run_sparse_mla_prefill(Sparse_mla_prefill_params &params,
     const int total_slots = swa_slots + extra_slots;
 
     dim3 grid((params.num_heads + BLOCK_M - 1) / BLOCK_M, params.num_tokens);
-    if (params.int8_cache) {
-        int smem = (int)sizeof(SmemInt8);
-        static bool attr_set_int8 = false;
-        if (!attr_set_int8) {
-            cudaFuncSetAttribute(sparse_prefill_fused_mma_kernel<true>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-            attr_set_int8 = true;
-        }
-        sparse_prefill_fused_mma_kernel<true><<<grid, NTHREADS, smem, stream>>>(
-            params, swa_slots, total_slots);
-        return;
+    if (params.cache_format == Sparse_mla_cache_format::INT8_DS_MLA) {
+      int smem = (int)sizeof(SmemInt8);
+      static bool attr_set_int8 = false;
+      if (!attr_set_int8) {
+        cudaFuncSetAttribute(sparse_prefill_fused_mma_kernel<
+                                 Sparse_mla_cache_format::INT8_DS_MLA>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        attr_set_int8 = true;
+      }
+      sparse_prefill_fused_mma_kernel<Sparse_mla_cache_format::INT8_DS_MLA>
+          <<<grid, NTHREADS, smem, stream>>>(params, swa_slots, total_slots);
+      return;
+    }
+    if (params.cache_format == Sparse_mla_cache_format::FP4_DS_MLA) {
+      int smem = (int)sizeof(SmemFP4);
+      static bool attr_set_fp4 = false;
+      if (!attr_set_fp4) {
+        cudaFuncSetAttribute(sparse_prefill_fused_mma_kernel<
+                                 Sparse_mla_cache_format::FP4_DS_MLA>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        attr_set_fp4 = true;
+      }
+      sparse_prefill_fused_mma_kernel<Sparse_mla_cache_format::FP4_DS_MLA>
+          <<<grid, NTHREADS, smem, stream>>>(params, swa_slots, total_slots);
+      return;
     }
 
     {
@@ -497,10 +581,11 @@ void run_sparse_mla_prefill(Sparse_mla_prefill_params &params,
     int smem = (int)sizeof(Smem);
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(sparse_prefill_fused_mma_kernel<false>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        attr_set = true;
+      cudaFuncSetAttribute(
+          sparse_prefill_fused_mma_kernel<Sparse_mla_cache_format::FP8_DS_MLA>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      attr_set = true;
     }
-    sparse_prefill_fused_mma_kernel<false><<<grid, NTHREADS, smem, stream>>>(
-        params, swa_slots, total_slots);
+    sparse_prefill_fused_mma_kernel<Sparse_mla_cache_format::FP8_DS_MLA>
+        <<<grid, NTHREADS, smem, stream>>>(params, swa_slots, total_slots);
 }
