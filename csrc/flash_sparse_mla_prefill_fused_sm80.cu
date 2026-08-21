@@ -35,6 +35,7 @@
 #include <type_traits>
 
 #include "flash_mla.h"
+#include "fp4_ds_mla.cuh"
 
 namespace {
 
